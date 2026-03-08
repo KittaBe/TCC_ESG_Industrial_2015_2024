@@ -1,0 +1,10 @@
+pandas
+numpy
+statsmodels
+matplotlib
+seaborn
+openpyxl
+yfinance
+tqdm
+unidecode
+requests
