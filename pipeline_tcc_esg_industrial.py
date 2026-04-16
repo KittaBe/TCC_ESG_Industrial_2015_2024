@@ -1,31 +1,35 @@
 # ==============================================================
-# PIPELINE TCC ESG (INDUSTRIAL) 2019–2024
+# PIPELINE TCC ESG (INDUSTRIAL) 2015–2024
 # - Baixa DFP da CVM (DRE/BPA/BPP consolidados)
 # - Busca dados de mercado (Yahoo Finance)
-# - Calcula indicadores e cria Excel com fórmulas e formatação
+# - Calcula indicadores e cria Excel com FÓRMULAS e formatação
 # ==============================================================
 
-import os, re, io, zipfile, requests, math
+import os, zipfile, requests, time
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta
 from tqdm import tqdm
 from unidecode import unidecode
 import yfinance as yf
+from typing import Optional
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import numbers
 from openpyxl.utils import get_column_letter
-from typing import Optional  # <-- para Optional[float]
 
 # -----------------------------
 # CONFIGURAÇÕES
 # -----------------------------
-ANOS = list(range(2019, 2025))
-SAIDA_XLSX = r"C:\Users\Kitta\OneDrive\Desktop\TCC\Python\base_industrial_2019_2024.xlsx"
-CACHE_DIR = "cvm_cache"
+ANOS = list(range(2015, 2025))  # 2015–2024
 
-# Empresas-alvo: aliases para identificar DENOM_CIA
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(BASE_DIR, exist_ok=True)
+
+SAIDA_XLSX = os.path.join(BASE_DIR, "base_industrial_2015_2024.xlsx")
+CACHE_DIR = os.path.join(BASE_DIR, "cvm_cache")
+
+# Empresas-alvo
 EMPRESAS = {
     "Klabin S.A.": {
         "aliases": ["KLABIN", "KLABIN S.A."],
@@ -59,7 +63,6 @@ EMPRESAS = {
     },
 }
 
-# Palavras-chave para localizar contas nas demonstrações
 KW = {
     "receita":   [r"receita", r"vendas líquidas", r"receita operacional líquida", r"receita de venda"],
     "lucro":     [r"lucro.*(exerc|per[ií]odo)", r"preju[ií]zo.*(exerc|per[ií]odo)", r"lucro.*liquido"],
@@ -70,9 +73,6 @@ KW = {
     "caixa":     [r"caixa", r"equivalentes de caixa", r"dispon[ií]vel"]
 }
 
-# -----------------------------
-# FUNÇÕES AUXILIARES
-# -----------------------------
 def norm(s: str) -> str:
     return unidecode(str(s or "")).upper().strip()
 
@@ -80,16 +80,27 @@ def match_empresa(denom: str, aliases: list[str]) -> bool:
     d = norm(denom)
     return any(a in d for a in [norm(x) for x in aliases])
 
+def request_with_retry(url: str, retries: int = 3, timeout: int = 120) -> bytes:
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.content
+        except Exception:
+            if i == retries - 1:
+                raise
+            time.sleep(2 * (i + 1))
+    return b""
+
 def baixar_zip_dfp(ano: int) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     fname = f"dfp_cia_aberta_{ano}.zip"
     path = os.path.join(CACHE_DIR, fname)
     if not os.path.exists(path):
         url = f"https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/{fname}"
-        r = requests.get(url, timeout=120)
-        r.raise_for_status()
+        content = request_with_retry(url)
         with open(path, "wb") as f:
-            f.write(r.content)
+            f.write(content)
     return path
 
 def carregar_csv(z: zipfile.ZipFile, marcador: str) -> Optional[pd.DataFrame]:
@@ -112,7 +123,6 @@ def filtrar_empresa_ano(df: Optional[pd.DataFrame], aliases: list[str], ano: int
     return df
 
 def pick_valor(df: pd.DataFrame, keywords: list[str]) -> Optional[float]:
-    """Retorna o valor numérico (float) mais agregado para as palavras-chave, ou None se não encontrar."""
     if df is None or df.empty or "DS_CONTA" not in df.columns or "VL_CONTA" not in df.columns:
         return None
     desc = df["DS_CONTA"].astype(str).apply(norm)
@@ -170,14 +180,19 @@ for ano in tqdm(ANOS, desc="Processando anos DFP/CVM"):
             lucro   = pick_valor(dre_y, KW["lucro"])
             ativos  = pick_valor(bpa_y, KW["ativo"])
             pl      = pick_valor(bpp_y, KW["pl"])
-            passivo = pick_valor(bpp_y, KW["passivo"])
+
+            passivo_raw = pick_valor(bpp_y, KW["passivo"])
+
+            # CORREÇÃO CONTÁBIL
+            if ativos is not None and pl is not None:
+                passivo = ativos - pl
+            else:
+                passivo = passivo_raw
+
             caixa   = pick_valor(bpa_y, KW["caixa"])
             depam   = pick_valor(dre_y, KW["depamort"])
 
-            # EBITDA aproximado (mínimo auditável)
             ebitda = (lucro or 0) + (depam or 0)
-
-            # Marketcap e EV
             mktcap = marketcap_historica(ticker, ano)
             div_liq = (passivo or 0) - (caixa or 0)
             ev = (mktcap or 0) + div_liq
@@ -193,22 +208,26 @@ for ano in tqdm(ANOS, desc="Processando anos DFP/CVM"):
             })
 
 # -----------------------------
-# EXPORTAR EXCEL COM FÓRMULAS
+# EXPORTAR EXCEL (SEM ALTERAÇÃO)
 # -----------------------------
 df = pd.DataFrame(linhas).sort_values(["Empresa", "Ano"]).reset_index(drop=True)
 
 wb = Workbook()
 ws = wb.active
 ws.title = "Base"
+
 for r in dataframe_to_rows(df, index=False, header=True):
     ws.append(r)
 
 col_map = {cell.value: idx+1 for idx, cell in enumerate(ws[1])}
-def COL(name): return get_column_letter(col_map[name])
+
+def COL(name):
+    return get_column_letter(col_map[name])
 
 headers_calc = ["Margem Líquida", "ROE", "ROA", "Dívida/Patrimônio", "EV/EBITDA"]
 for h in headers_calc:
     ws.cell(row=1, column=ws.max_column+1, value=h)
+
 first_calc_col = ws.max_column - len(headers_calc) + 1
 
 for row in range(2, ws.max_row+1):
@@ -226,21 +245,6 @@ for row in range(2, ws.max_row+1):
 for c in range(1, ws.max_column+1):
     ws.column_dimensions[get_column_letter(c)].width = 20
 
-num_cols = [
-    "Receita","Lucro Líquido","Ativos","Patrimônio","Passivo Total",
-    "Caixa e Equivalentes","Depreciação/Amortização","EBITDA (aprox)",
-    "MarketCap (hist)","EV (calc)","P/E (calc)"
-]
-for row in range(2, ws.max_row+1):
-    for nm in num_cols:
-        if nm in col_map:
-            ws.cell(row=row, column=col_map[nm]).number_format = numbers.FORMAT_NUMBER_COMMA_SEPARATED1
-    ws.cell(row=row, column=first_calc_col + 0).number_format = "0.00%"
-    ws.cell(row=row, column=first_calc_col + 1).number_format = "0.00%"
-    ws.cell(row=row, column=first_calc_col + 2).number_format = "0.00%"
-    ws.cell(row=row, column=first_calc_col + 3).number_format = numbers.FORMAT_NUMBER_COMMA_SEPARATED1
-    ws.cell(row=row, column=first_calc_col + 4).number_format = numbers.FORMAT_NUMBER_COMMA_SEPARATED1
-
-os.makedirs(os.path.dirname(SAIDA_XLSX), exist_ok=True)
 wb.save(SAIDA_XLSX)
+
 print(f"✅ Excel gerado em: {SAIDA_XLSX}")
